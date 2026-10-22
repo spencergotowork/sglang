@@ -1,0 +1,487 @@
+---
+title: "SGLang 的分页 attention 与分段 KV 计算"
+description: "从完整公式、online softmax 和 split-KV 归并，读懂 SGLang 的 KV 索引与 Triton decode 实现。"
+sidebarTitle: "Paged attention 源码解读（中文）"
+---
+
+## 先回答：不是需要所有 KV 吗？
+
+**需要所有有效 KV 参与结果，不等于需要把所有 KV 同时载入片上内存。**
+
+对普通 dense attention，一个 query 必须考虑所有未被 mask 的 key/value。实现可以逐小块读取 KV，维护少量统计量，最后得到与完整 softmax 相同的数学结果；也可以让多个线程块分别处理不同 KV 段，再正确归并。
+
+请先分清三件不同的事：
+
+| 机制 | 解决什么问题 | 不代表什么 |
+| --- | --- | --- |
+| Paging，分页存储与寻址 | KV 不必占据一个连续的大区间，便于按需分配、回收与共享 | 不会自动省略历史 KV 的 attention |
+| Tiling + online softmax，逐块流式计算 | 片上存储有限，避免物化整条 score/probability 向量或大矩阵 | 不是每块各自 softmax 后直接相加 |
+| Split-KV，沿 KV 长度并行 | 单 query 的长序列能由多个 CTA/workgroup 分担，提高并行度 | 不是页面大小，也不是请求调度的 chunked prefill |
+
+页大小 `page_size`、计算块大小 `BLOCK_N`、每段长度 `kv_len_per_split` 是三个尺度，**不需要相等**。
+
+本文按“公式 → 数值例子 → 实际数据结构 → 调用链与 kernel”阅读。分析基于固定源码提交
+[`b453996b7dcd20c6b1927c2c66e240a236be2189`](https://github.com/sgl-project/sglang/commit/b453996b7dcd20c6b1927c2c66e240a236be2189)，取样日期为 2026-10-22。源码链接全部固定到该提交，后续版本的路径、默认后端和调度策略可能不同。
+
+<Note>
+主线是标准 MHA/GQA 的 Triton decode 两阶段实现，而不是声称所有 SGLang attention 都走同一个 kernel。本文附带的 CPU 脚本验证数学等价性；没有运行 GPU kernel、模型推理或性能 benchmark。
+</Note>
+
+## 1. 完整 attention 公式
+
+固定一个 query 位置 $i$ 和一个 query head。令 $q_i,k_j\in\mathbb{R}^{d_k}$，$v_j\in\mathbb{R}^{d_v}$，有效 key 位置集合为 $\mathcal{J}_i$。
+
+$$
+s_{ij}=\frac{q_i^T k_j}{\sqrt{d_k}}+b_{ij},\qquad
+p_{ij}=\frac{\exp(s_{ij})}{\sum_{t\in\mathcal{J}_i}\exp(s_{it})},\qquad
+o_i=\sum_{j\in\mathcal{J}_i}p_{ij}v_j.
+$$
+
+这里 $b_{ij}$ 可表示合法的加性 bias；被 mask 的位置可视为 score 等于 $-\infty$。后文先用默认缩放、无额外 score modification 的形式推导。模型指定的 scale、logit cap、温度或 sink 需要按具体实现加入，不能直接忽略。
+
+简化固定的下标后：
+
+$$
+o=\frac{\sum_j\exp(s_j)v_j}{\sum_j\exp(s_j)}.
+$$
+
+关键是：我们只需要“加权和 / 权重总和”，不一定需要保存所有 $p_j$。直接计算 $\exp(s_j)$ 又可能溢出，因此还要引入稳定化的最大值。
+
+## 2. 三个状态就能表示已经处理过的 KV
+
+对一个非空、至少有一个有效元素的位置集合 $A$，定义：
+
+$$
+m_A=\max_{j\in A}s_j,
+\qquad l_A=\sum_{j\in A}\exp(s_j-m_A),
+\qquad u_A=\sum_{j\in A}\exp(s_j-m_A)v_j.
+$$
+
+- $m_A$：当前最大 score，标量。
+- $l_A$：在当前最大值基准下的指数和，标量。
+- $u_A$：在相同基准下的加权 value 和，长度为 $d_v$ 的向量。
+
+这个集合独立归一化的输出是 $o_A=u_A/l_A$。注意 $u_A$ 还不是最终输出。
+
+### 合并两个不重叠集合
+
+设 $A$ 和 $B$ 是不重叠的 KV 段，先统一指数基准：
+
+$$
+m=\max(m_A,m_B),\qquad
+\alpha=\exp(m_A-m),\qquad
+\beta=\exp(m_B-m).
+$$
+
+然后：
+
+$$
+l=\alpha l_A+\beta l_B,\qquad
+u=\alpha u_A+\beta u_B,\qquad
+o=\frac{u}{l}.
+$$
+
+为什么成立？对任意 $j\in A$：
+
+$$
+\exp(m_A-m)\exp(s_j-m_A)=\exp(s_j-m).
+$$
+
+乘一个统一的修正系数就把旧贡献转换到了新基准。**即使后面出现更大的 score，也不用重新读取前面的 KV**，只需要缩放旧的 $l$ 和 $u$。
+
+这些状态可按顺序合并，也可树形归并；实数算术下结果相同。浮点加法不满足严格结合律，所以不同 tile/split 的舍入可能不同，不能声称逐位一致。
+
+### 顺序扫描：online softmax
+
+在已经处理的状态 $(m,l,u)$ 后面读入一个新 tile $T$：
+
+$$
+m'=\max\left(m,\max_{j\in T}s_j\right),\qquad
+\rho=\exp(m-m'),\qquad p_j'=\exp(s_j-m').
+$$
+
+$$
+l'=\rho l+\sum_{j\in T}p_j',\qquad
+u'=\rho u+\sum_{j\in T}p_j'v_j.
+$$
+
+处理完所有 tile，才输出 $u/l$。这里的 $p_j'$ 是以新最大值为基准的未归一化权重，不是完整序列的 softmax probability。
+
+初始化通常写作 $m=-\infty,l=0,u=0$。但空块和全 mask 块必须单独处理，避免 $-\infty-(-\infty)$ 产生 NaN；全 mask query 的输出也必须有明确约定。本文 CPU 参考实现约定输出零向量、LSE 为 $-\infty$，**不把这个约定冒充所有 SGLang 后端的行为**。
+
+## 3. 并行扫描：split-KV 如何归并
+
+让每个 split $r$ 各自扫描若干 tile，得到 $(m_r,l_r,u_r)$。不同 split 必须构成有效 KV 的不重叠划分，不能漏算或重复计数。
+
+$$
+m=\max_r m_r,\qquad
+l=\sum_r\exp(m_r-m)l_r,\qquad
+u=\sum_r\exp(m_r-m)u_r,\qquad o=u/l.
+$$
+
+实际 kernel 不一定写出这三个原始状态。本文标准 Triton 路径写的是：
+
+$$
+o_r=u_r/l_r,\qquad L_r=m_r+\log l_r
+     =\log\sum_{j\in r}\exp(s_j).
+$$
+
+$L_r$ 就是该段的 log-sum-exp，简称 LSE。它保留了“这一段在全局 softmax 中有多少质量”的信息。
+
+令 $M=\max_r L_r$、$w_r=\exp(L_r-M)$：
+
+$$
+o=\frac{\sum_r w_r o_r}{\sum_r w_r},\qquad
+L=M+\log\sum_r w_r.
+$$
+
+因此，**只保存局部输出还不够，还必须保存 LSE 或等价归一化信息；不能简单平均局部输出**。标准两阶段 decode 的第二阶段只需要局部输出和 LSE，不需要再读全部原始 K/V。
+
+本文这条路径使用自然指数 `tl.exp` 和自然对数 `tl.log`。其他 kernel 若使用 `exp2`，必须同步检查 score 缩放和 LSE 的对数底，不能把两种约定直接混合。
+
+## 4. 一个完整的手算例子
+
+设 $d_k=d_v=1$，$q=[1]$，scale 为 1，无 mask：
+
+```text
+逻辑 token       0       1       2       3
+K / score        0       ln 2    ln 4    ln 8
+V               10      20      30      40
+exp(score)       1       2       4       8
+```
+
+### 一次性计算
+
+$$
+o=\frac{1\times10+2\times20+4\times30+8\times40}{1+2+4+8}
+ =\frac{490}{15}=32.6666666667.
+$$
+
+### 分成两段
+
+| 状态 | 段 A：token 0、1 | 段 B：token 2、3 |
+| --- | --- | --- |
+| 最大值 $m$ | $\ln2$ | $\ln8$ |
+| 稳定化指数 | $[1/2,1]$ | $[1/2,1]$ |
+| 指数和 $l$ | $1.5$ | $1.5$ |
+| 加权和 $u$ | $0.5\times10+20=25$ | $0.5\times30+40=55$ |
+| 局部输出 $o$ | $25/1.5=16.6667$ | $55/1.5=36.6667$ |
+| LSE | $\ln2+\ln1.5=\ln3$ | $\ln8+\ln1.5=\ln12$ |
+
+用 $(m,l,u)$ 合并，统一到 $m=\ln8$：
+
+$$
+\alpha=\exp(\ln2-\ln8)=1/4,\quad \beta=1,
+\quad l=(1/4)1.5+1.5=1.875,
+\quad u=(1/4)25+55=61.25.
+$$
+
+结果 $61.25/1.875=32.6666666667$。这也正是先扫描 A、再扫描 B 时 online softmax 的更新。
+
+用 $(o,\mathrm{LSE})$ 合并，两个 split 的全局权重为 $3/15=1/5$ 和 $12/15=4/5$：
+
+$$
+o=\frac15\times16.6666666667+\frac45\times36.6666666667
+ =32.6666666667.
+$$
+
+错误做法的简单平均是 $26.6666666667$。即使两个段 token 数一样，softmax 质量也不一定一样。
+
+### 同一例子换成不连续页面
+
+令 `page_size = 2`，逻辑页到物理页的映射是 `[5, 1]`：
+
+```text
+逻辑 token      0   1   2   3
+逻辑 page       0   0   1   1
+物理 page       5   5   1   1
+页内 offset     0   1   0   1
+物理 token slot 10  11  2   3
+```
+
+kernel 按逻辑顺序取得物理 slot `[10, 11, 2, 3]`，再读对应 K/V。页面不相邻不会改变数学结果。这个小例子为了便于手算碰巧把页边界和 split 边界对齐；实际 tile、page、split 可以互相跨越，附带脚本专门检查这种情况。
+
+## 5. 显存分页、索引表与片上分块不是同一层
+
+对一般页表形式，设逻辑 token 为 $j$，页大小为 $P$，页表为 $\mathrm{table}$：
+
+$$
+\mathrm{logical\_page}=\lfloor j/P\rfloor,\qquad
+\mathrm{offset}=j\bmod P,\qquad
+\mathrm{physical\_slot}=\mathrm{table}[\mathrm{logical\_page}]P+\mathrm{offset}.
+$$
+
+实际地址还要加上 layer/head/dimension 的 stride。页表只是布局映射；mask、位置 bias 和 RoPE 的语义依赖逻辑 token 位置，不是物理 page ID。
+
+SGLang 的请求表和 attention 元数据也可以直接持有**展开后的物理 token slot 列表**。这时 kernel 不一定拿一个传统的“每页一个 ID”的 block table。看到 `kv_indices`，首先要查它在这个后端究竟是 token ID 还是 page ID，不能仅凭变量名判断。
+
+对于通常驻留 GPU 的 KV cache，数据流是：
+
+```text
+GPU 全局显存中的 KV pool
+  → 由请求元数据找到这一小块的物理地址
+  → 按硬件缓存/寄存器/共享内存布局载入当前计算块
+  → 更新 score、m、l、u
+  → 进入下一块；最终写出局部或最终输出
+```
+
+不是“每个 decode step 都把全部历史 KV 从 CPU 拉进 GPU”。CPU offload、HiCache 和分布式传输是另外的层。也不要把 `tl.load` 的每个张量都等同于显式 shared-memory buffer；Triton 编译器和 GPU 决定具体寄存器、共享内存与缓存使用。
+
+对单 query，计算仍需要与长度 $N$ 成正比的 KV 工作量，约为 $O(Nd_k+Nd_v)$。收益来自内存管理、减少中间结果读写与提高并行度，不是把任意 dense attention 变成 $O(1)$。GQA 复用、缓存命中、多个 query tile 和不同 CTA 会影响真实访存，不能声称每个 KV 在整个 GPU 上恰好只读一次。
+
+## 6. 先确认 SGLang 实际选择了哪个后端
+
+`RadixAttention` 是统一入口，不是唯一一个 attention kernel。通常路径为：
+
+```text
+模型 attention layer
+  → RadixAttention.forward
+  → 当前 AttentionBackend.forward
+  → forward_decode 或 forward_extend
+  → 选定后端自己的 kernel / 外部库
+```
+
+[`RadixAttention.forward`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/radix_attention.py#L112-L178) 最终调用当前 backend；
+[`AttentionBackend.forward`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/base_attn_backend.py#L307-L349) 按 forward mode 分派。图编译、混合模式、稀疏模型等还有额外路径，不能仅凭模型使用 `RadixAttention` 就断言它执行 Triton。
+
+启动时，配置解析会考虑显式的 attention/prefill/decode backend、模型类型、硬件、speculative decoding 等条件；prefill 和 decode 可以不同。
+[`ModelRunner.init_attention_backends`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/model_executor/model_runner.py#L1092-L1115) 解析后端名称、构建实例并绑定 KV index translator。
+注册表的 [`create_triton_backend`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/attention_registry.py#L206-L215) 才构造 `TritonAttnBackend`。
+
+本提交的一般默认策略中，普通 MHA 在满足条件的 Hopper 上可选 FA3，SM100 上可选 TRTLLM MHA（非对称 K/V 维度可能选 FA4），HIP 可选 AITER，其他场景再考虑 FlashInfer/Triton。MLA 另有分支，模型专用 override 也可能覆盖这些决定。这里是在说明“选择确实依条件变化”，不是提供一个跨版本默认值表。请核对
+[`get_default_attn_backend`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/arg_groups/model_override_base.py#L277-L353)、
+[`_attention_backend_default`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/arg_groups/overrides.py#L1109-L1126) 和实际启动日志。
+
+后文选 Triton，是因为它把索引、流式 softmax 和 split 归并直接写在可读的 Python/Triton 源码里。FlashInfer、FA3/FA4、TRTLLM、MLA、稀疏或线性 attention 的布局与调度不能机械套用本节。一般支持情况可参考 [attention backend 文档](/docs/advanced_features/attention_backend)，具体实现仍以目标提交的代码和测试为准。
+
+## 7. 从请求 token 到 KV 地址
+
+### 分配器先决定 slot，kernel 再读取内容
+
+在普通配置中，page size 为 1 时可逐 token 分配；更大的页使用分页分配器，见
+[`KV cache allocator 选择`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/kv_cache_configurator.py#L2713-L2736)。
+[`PagedTokenToKVPoolAllocator.alloc`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/allocator/paged.py#L181-L202)
+从空闲页拿 page ID，再展开为 `page_id * page_size + offset` 的 token slot 列表。
+增量 decode 在尾页有空间时继续使用该页，跨页时才取新页，见
+[`alloc_decode_kernel`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/memory/allocator.py#L203-L235)。
+[`alloc_for_decode_default`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/allocation.py#L625-L665)
+把新 slot 写入请求表的下一个逻辑 token 位置。
+普通 decode 先写到旧 `seq_len` 位置，再将长度加一，因此后续 attention 元数据包含历史和当前 token，见
+[`ScheduleBatch` 的更新顺序](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/managers/schedule_batch.py#L3773-L3786)。
+实际 K/V 在 `forward_decode` 中写入后参与读取。extend 则同时接上已有 prefix 索引与新分配的位置，见
+[`alloc_for_extend`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/allocation.py#L374-L464)。
+这些是分配和建表，不是在这里完成 softmax；统一池还会在后续读写路径中转换地址空间。
+
+### 三种表不要混淆
+
+| 对象 | 本文主线中的作用 |
+| --- | --- |
+| `ReqToTokenPool.req_to_token` | 从请求槽位和逻辑 token 位置找到 KV ID；这个 ID 的地址空间取决于 pool/plan |
+| `kv_indptr` | 每个请求在扁平 `kv_indices` 中的起止偏移，类似 CSR |
+| `kv_indices` | 交给当前 kernel 的读流；标准 Triton 路径按 token slot 寻址，而非每页一个 ID |
+| `K_Buffer`、`V_Buffer` | 某一层实际的 KV cache tensor/view，地址由 slot/head/dimension stride 计算 |
+
+[`ReqToTokenPool`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/memory_pool.py#L375-L417) 管请求表，
+[`MHATokenToKVPool`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/memory_pool.py#L2183-L2223) 管 KV 存储。
+不要假定请求表里的 ID 永远已是最终物理地址：新版统一池可使用虚拟 slot，由
+[`KVIndexTranslator.pack_read_stream`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/mem_cache/kv_index_translator.py#L531-L631) 根据 `KVLocPlan` 的地址空间转换为当前后端需要的读流。
+
+Triton backend 的
+[`_fill_kv_indptr_and_indices`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L515-L537)
+先用序列长度的累计和填写 `kv_indptr[1:]`，再调用 translator 写 `kv_indices`。
+
+例如两个请求长度为 4 和 3，读流可以是：
+
+```text
+kv_indptr = [0, 4, 7]
+kv_indices = [10, 11, 2, 3, 20, 21, 8]
+              请求 0          请求 1
+```
+
+请求 0 只扫描 `[0,4)`，请求 1 扫描 `[4,7)`。这里的累计和与索引是小型元数据，不是把 K/V payload 全部复制、拼接成一个连续缓存。
+
+### 本提交的 Triton 不应再笼统写成“只支持 page size 1”
+
+本提交仍有一些旧注释/文档写着只支持 page size 1，但实际调用链已经传入 `page_size`，kernel 有 page-aware 寻址，而且仓库存在 `page_size=16` 的 decode/extend 测试定义：
+
+- backend 读取 [`model_runner.page_size`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L218-L228)，普通 decode 将其传给 kernel。
+- [`_extract_kv_strides`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L212-L225) 要求三维 KV view，计算 `page_stride = slot_stride * page_size`。
+- [`stage1` 的 page-aware 分支](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L320-L350) 使用 `page_id = kv_loc // PAGE_SIZE`、`tok_in_p = kv_loc % PAGE_SIZE`。
+- [`dense Triton 测试定义`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/test/registered/attention/unittests/dense/test_triton.py#L41-L94) 包含 page size 16 的 decode 和跨页 extend。
+
+这说明当前实现具有该参数和寻址路径，**不等于支持任意四维 page-major layout**；上述 stride helper 明确拒绝非三维输入。本文只阅读了这些 GPU 测试的定义，没有执行它们。
+
+## 8. 标准 Triton decode：把公式逐项对到代码
+
+源码主文件是
+[`python/sglang/kernels/ops/attention/decode_attention.py`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py)，不是旧版本的 `srt/layers/attention/triton_ops/` 路径。
+
+### 入口与中间缓存
+
+[`TritonAttnBackend.forward_decode`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L2288-L2502) 的主要工作是：
+
+1. 整理 Q 与输出形状，并在需要时把当前 token 的 K/V 写到 `KVWriteLoc` 指定的位置。
+2. 普通层选 `kv_indptr/kv_indices`；滑动窗口层选 `window_kv_indptr/window_kv_indices`。
+3. 从 pool 取该层的 key/value buffer，将 scale、split 数、page size 等传给 `decode_attention_fwd`。
+
+本节限定为普通单设备 KV 主线，不展开 DCP、speculative draft/verify 和特殊模型变体。
+
+元数据分配的中间缓存为：
+
+```text
+attn_logits: [batch, query_heads, max_kv_splits, value_head_dim], FP32
+attn_lse:    [batch, query_heads, max_kv_splits], FP32
+```
+
+见 [`forward metadata 分配`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L953-L978)。
+**`attn_logits` 这个名字容易误导：在这里它存每段的局部输出，不是长度为 N 的完整 attention logits。**
+若 split 数为 $R$，中间数据规模约为 $O(BH_qR(d_v+1))$，而不是完整 score tensor 的 $O(BH_qN)$。
+
+### Stage1：一个程序负责一个 split
+
+[`_decode_att_m_fwd`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L430-L527) 的普通 MHA grid 是 `(batch, head_num, max_kv_splits)`。
+[`_fwd_kernel_stage1`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L235-L427) 取三个 program ID，确定请求、query head 和 split。
+
+这条分支在本提交中将每段长度向 `MIN_BLOCK_KV=32` 的倍数取整：
+
+```python
+kv_len_per_split = ceil(ceil(seq_len / kv_splits) / 32) * 32
+split_start = kv_len_per_split * split_id
+split_end = min(split_start + kv_len_per_split, seq_len)
+```
+
+这里是对源码公式的等价伪代码，不是新增 API。`num_kv_splits` 可按序列长度、设备核心数、确定性选项等选择，见
+[`get_num_kv_splits`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L431-L481)。split 数不等于 page 数；上界 grid 里没有有效 token 的 split 会跳过。
+
+然后 `for start_n in range(split_kv_start, split_kv_end, BLOCK_N)` 逐 tile 执行：
+
+1. 从 `kv_indices` 载入本 tile 的物理 `kv_loc`。
+2. 根据 `kv_loc` 和 stride 载入这一小块 K/V。
+3. 计算 QK score 并应用 scale、可选 score modification 和 tail mask。
+4. 按 online softmax 递推更新三个状态。
+
+| 数学量 | Stage1 变量 | 对应意义 |
+| --- | --- | --- |
+| $s_j$ | `qk` | 当前 tile 的 score |
+| $m$ | `e_max` | 已处理 tile 的最大 score |
+| $m'$ | `n_e_max` | 新旧合并后的最大值 |
+| $\exp(m-m')$ | `re_scale` | 旧状态修正系数 |
+| $\exp(s_j-m')$ | `p` | 当前 tile 的未归一化指数权重 |
+| $l$ | `e_sum` | 稳定化指数和 |
+| $u$ | `acc` | 稳定化 value 加权和 |
+| $o_r$ | `Att_Out` 中的 `acc / e_sum` | 该 split 的局部归一化输出 |
+| $L_r$ | `Att_Lse` 中的 `e_max + tl.log(e_sum)` | 该 split 的 LSE |
+
+最关键的源码位于 [396–426 行](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L396-L426)：它与第 2 节公式逐项对应。每次循环只持有当前 tile 的 score 和固定大小的累计状态，不保存完整的历史 softmax 向量。
+
+### Stage2：LSE 加权，而不是平均
+
+[`_fwd_kernel_stage2`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L935-L1018) 按请求和 head 读取有效 split：
+
+```text
+tv        = Mid_O   中的局部输出 o_r
+tlogic    = Mid_O_1 中的 LSE L_r
+n_e_max   = max(旧 LSE 最大值, tlogic)
+old_scale = exp(旧 LSE 最大值 - n_e_max)
+exp_logic = exp(tlogic - n_e_max)
+acc       = acc * old_scale + exp_logic * tv
+e_sum     = e_sum * old_scale + exp_logic
+输出       = acc / e_sum * v_scale
+```
+
+它其实又做了一次稳定的 online 归并，只是这次被归并的“score”是各段 LSE，被加权的“value”是各段输出。这里 `e_max` 已不是原始 token score 的最大值，要与 stage1 区分。
+
+无 sink、scale 为 1 时，这就是第 3 节公式。有 attention sink 时，源码还向分母加入 sink 的指数质量；量化 KV 的 `v_scale` 在最终输出处应用。不能在解释特定模型的输出时漏掉这些额外语义。
+
+### GQA/MQA：共享 KV，但不共享 softmax 状态
+
+令 $G=H_q/H_{kv}$，一般 contiguous-group GQA 使用：
+
+$$
+h_{kv}=\left\lfloor\frac{h_q}{G}\right\rfloor.
+$$
+
+[`decode_attention_fwd`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L1191-L1316) 根据 `kv_group_num` 分派普通和 grouped 路径。
+[`_fwd_grouped_kernel_stage1`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L530-L789) 把多个 query head 组成 tile，共享 K/V 读取和矩阵乘，但每个 query head 仍有自己的 `e_max/e_sum/acc`。
+
+因此共享 KV head 不等于共享 attention 分布。MQA 是只有一个 KV head 的特例。MLA 还涉及压缩缓存和额外维度，这个 grouped kernel 虽有 MLA 分支，不能据此把 MLA 解释成普通 GQA 缓存。
+
+## 9. Prefill、mask 与其他实现边界
+
+### Prefill/extend 有多行 query
+
+单 token decode 每个 head 只有一行 query，经典 score 形状是 `1 × N`。Prefill 处理多行 query，经典自注意力 score 才可能是 `N × N`。不要说每个 decode step 都避免了一个原本必然存在的 `N × N` 矩阵。
+
+Triton 的 [`extend_attention.py`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/extend_attention.py#L375-L912) 在普通 causal extend 路径中按 query tile 处理，先间接读取 prefix cache，再扫描本次 extend 的连续 K/V，并维护每个 query row 的 softmax 状态；当前 chunk 的 causal mask 排除未来 token。源码中这里的“stage 1/2”是同一 kernel 内 prefix/current-chunk 两个扫描阶段，**不是 decode 的并行 split stage1 与 reduction stage2**。
+
+这不是所有 prefill 的固定形式：custom mask 分支可替代默认 causal mask；确定性 unified extend 则可把 prefix 与当前 chunk 的 token IDs 合并，统一从 cache 作一次扫描。相关分支见
+[`extend 的 mask`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/extend_attention.py#L738-L763) 和
+[`unified extend 调用`](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/srt/layers/attention/triton_backend.py#L2238-L2284)。
+
+普通 decode 的有效读流已限定到当前可见历史；尾块用长度 mask 排除 padding。滑动窗口还可由 backend 选择窗口读流。Speculative verify 的树形 mask、额外 score modification、非 causal attention 等不能当成同一种简单三角 mask。
+
+前缀/Radix cache 复用以前算出的 K/V、减少重复 prefill，不意味着新 query 可以跳过缓存前缀的 attention。Chunked prefill 是调度上的输入分块，也不等于页、kernel tile 或 split-KV。
+
+### Triton 也不总是两次 kernel launch
+
+本提交的 `decode_attention_fwd` 在符合条件的 ROCm/AMD 上还可能进入 Lean persistent/work-stealing decode 分支，见
+[1235–1267 行](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L1235-L1267)。
+它还检查 head 维度、backend 的长度/图捕获策略、功能兼容性与 scratch buffers；确定性选项和禁用开关也会影响选择。本文逐行解读的是**标准两阶段分支**，不是把 Lean 或其他库的调度细节等同于它。
+
+### 数值精度
+
+- stable softmax 避免了大正 score 直接取指数的溢出，但不是任意 NaN/Inf 输入的修复器。
+- 标准路径的累计 `acc` 与局部输出/LSE 缓冲区使用 FP32；实际 Q/K/V 可能是低精度，不能称全程 FP32。
+- 普通 stage1 对乘积作 FP32 reduction；grouped 路径通常将 `p` 转成 V 的 dtype 再做 `P·V`，gfx1250 有保留 FP32 的特殊分支，见 [750–765 行](https://github.com/sgl-project/sglang/blob/b453996b7dcd20c6b1927c2c66e240a236be2189/python/sglang/kernels/ops/attention/decode_attention.py#L750-L765)。
+- split 数、tile 大小、归并顺序和低精度转换可能改变舍入误差。FP8 等量化还会引入量化误差，不能用数学等价性证明逐位相同或模型精度不变。
+- 只含 padding 的 split 可以跳过；任意自定义 mask 造成整行全屏蔽时，应核对具体后端约定。本报告没有证明所有生产 kernel 对这种输入都输出零。
+
+## 10. 用 CPU 参考程序亲自验证
+
+在仓库根目录运行，只需 Python 3.9 或更新版本，无 PyTorch、Triton、GPU 或模型权重依赖：
+
+```bash
+python3 test/manual/kernels/paged_attention_reference.py
+```
+
+该文件是解释公式的独立 oracle，不导入 SGLang、不注册 CI，也不运行生产 kernel。它比较：
+
+1. 对完整逻辑序列直接做稳定 softmax。
+2. 从随机打乱的物理页 gather 回逻辑 token 后计算。
+3. 按不同 tile 大小维护 $(m,l,u)$ 的 online softmax。
+4. 每段独立计算，再按局部输出与 LSE 归并。
+
+验证范围包括 seeds `7/19/2026`、page size `1/2/3/4/8/16`、非整页长度、不同 tile 与 split 边界、causal/sliding mask、GQA、极端有限 score、空 split、全 mask 行，以及四 token 例子的所有连续划分和逆序归并。脚本用 `None` 标记未填充页位置，检查尾页 padding 没有被当成有效 token。
+
+本次实际执行输出：
+
+```text
+Exact example: output = 490/15 = 32.6666666667
+Incorrect unweighted partial mean = 26.6666666667
+PASS: 120,960 split comparisons; seeds 7, 19, 2026.
+Dense/paged/online/split, masks, GQA, padding, extremes, empty rows: PASS
+Mathematical CPU reference only; no SGLang or GPU kernels were executed.
+```
+
+CPU 使用 Python float，比较容差在脚本 `check()` 中给出。它证明的是这些参考实现对测试输入的数学一致性，**不是** SGLang 的 GPU 正确性、性能、真实内存布局或后端支持矩阵测试。GPU 回归需要在相应硬件、依赖和模型条件下另行运行仓库现有测试。
+
+## 11. 阅读时记住的判断方法
+
+当你看到“KV 分段”时，依次问：
+
+1. 这是存储页、串行计算 tile、并行 split，还是 prefill 调度 chunk？
+2. 索引指向逻辑位置、虚拟 slot、物理 token slot，还是物理 page？
+3. 局部状态保存了什么：原始 $(m,l,u)$，还是归一化输出加 LSE？
+4. 合并时是否恢复了正确的全局 softmax 权重？
+5. 有效 token 是否被恰好覆盖一次，mask 和尾页是否处理正确？
+6. 这个结论对应哪个 commit、backend、硬件和实际分派分支？
+
+最简洁的答案是：**KV 可以分块读取、分段并行，因为 attention 的稳定加权和可以用少量状态精确合并。Paging 解决“放在哪里”，online softmax 解决“怎样边读边算”，split-KV 解决“怎样让多个计算单元一起算”。**
+
+## 参考资料
+
+- [FlashAttention 论文](https://arxiv.org/abs/2205.14135)：IO-aware exact attention、tiling 与稳定归一化。
+- [PagedAttention 论文](https://arxiv.org/abs/2309.06180)：分页 KV 管理、碎片与共享。
+- [Flash-Decoding 作者说明](https://crfm.stanford.edu/2023/10/12/flashdecoding.html)：沿 KV 序列并行与局部状态归并。
+- [FlashInfer attention-state 说明](https://docs.flashinfer.ai/tutorials/recursive_attention.html)：以输出和 LSE 表示、合并 attention 状态。
+- [FlashInfer KV layout 说明](https://docs.flashinfer.ai/tutorials/kv_layout.html)：不同后端的页表与布局约定，不能与 Triton token-index 流混为一谈。
