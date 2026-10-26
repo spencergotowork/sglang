@@ -1038,6 +1038,7 @@
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
                   "docs/developer_guide/quantization_contribution_guide",
+                  "docs/developer_guide/kv-cache-quantization-int8-guide",
                   "docs/developer_guide/layer_boundary"
                 ]
               },
