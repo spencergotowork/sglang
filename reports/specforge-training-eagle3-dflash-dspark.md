@@ -80,13 +80,13 @@ $`\displaystyle g_{a-1}=W_f[\,h_{a-1}^{\mathrm{low}};h_{a-1}^{\mathrm{mid}};h_{a
 
 将 anchor embedding 和融合后的状态分别归一化，再拼接：
 
-$`\displaystyle u_a=[\,\operatorname{RMSNorm}(E(x_a));\operatorname{RMSNorm}(g_{a-1})\,]\in\mathbb{R}^{2H_d}`$
+$`\displaystyle u_a=[\,\mathrm{RMSNorm}(E(x_a));\mathrm{RMSNorm}(g_{a-1})\,]\in\mathbb{R}^{2H_d}`$
 
 这个 `2*Hd` 输入进入 Q/K/V 投影。attention 输出回到 `Hd`，与原状态相加，再经过 MLP 和第二次 residual：
 
-$`\displaystyle r_a=g_{a-1}+\operatorname{Attention}(u_a;\mathrm{draft\ cache}),\qquad z_a=r_a+\operatorname{MLP}(\operatorname{RMSNorm}(r_a))`$
+$`\displaystyle r_a=g_{a-1}+\mathrm{Attention}(u_a;\mathrm{draft\ cache}),\qquad z_a=r_a+\mathrm{MLP}(\mathrm{RMSNorm}(r_a))`$
 
-$`\displaystyle q(x_{a+1}\mid\mathrm{prefix},x_a)=\operatorname{softmax}\!\left(W_{\mathrm{draft}}\operatorname{RMSNorm}(z_a)\right)`$
+$`\displaystyle q(x_{a+1}\mid\mathrm{prefix},x_a)=\mathrm{softmax}\!\left(W_{\mathrm{draft}}\mathrm{RMSNorm}(z_a)\right)`$
 
 上式对应默认 `norm_output=false` 的归一化放置；代码也支持把输出 norm 放进 backbone。抽取 token 后，下一步将 `z_a` 与新 token 的 embedding 继续送入同一个草稿层。**草稿状态不要求等于目标模型的下一位置 hidden state。**
 
@@ -158,11 +158,11 @@ forward(position_ids, attention_mask=None, noise_embedding=None,
 
 设多层目标特征融合结果为 `C`，某个草稿层的块表示为 `Z`。融合与 attention 的主要计算如下，矩阵记号使用行向量布局：
 
-$`\displaystyle C=\operatorname{RMSNorm}\!\left(\operatorname{Concat}_{\mathrm{feature}}(H^{(1)},\ldots,H^{(M)})W_f^{\mathsf T}\right)`$
+$`\displaystyle C=\mathrm{RMSNorm}\!\left(\mathrm{Concat}_{\mathrm{feature}}(H^{(1)},\ldots,H^{(M)})W_f^{\mathsf T}\right)`$
 
-$`\displaystyle Q=ZW_Q,\qquad \mathsf{K}=\operatorname{Concat}_{\mathrm{seq}}(CW_K,ZW_K),\qquad \mathsf{V}=\operatorname{Concat}_{\mathrm{seq}}(CW_V,ZW_V)`$
+$`\displaystyle Q=ZW_Q,\qquad \mathsf{K}=\mathrm{Concat}_{\mathrm{seq}}(CW_K,ZW_K),\qquad \mathsf{V}=\mathrm{Concat}_{\mathrm{seq}}(CW_V,ZW_V)`$
 
-$`\displaystyle \operatorname{Attn}(Z,C)=\operatorname{softmax}\!\left(\frac{\operatorname{RoPE}(Q)\operatorname{RoPE}(\mathsf{K})^{\mathsf T}}{\sqrt{d_h}}+\mathcal{M}\right)\mathsf{V}`$
+$`\displaystyle \mathrm{Attn}(Z,C)=\mathrm{softmax}\!\left(\frac{\mathrm{RoPE}(Q)\mathrm{RoPE}(\mathsf{K})^{\mathsf T}}{\sqrt{d_h}}+\mathcal{M}\right)\mathsf{V}`$
 
 这里直立体 Key/Value 符号表示张量，区别于 block size `K` 和词表大小 `V`；`d_h` 是单个 attention head 的宽度，`M` 的花体符号是允许位置为 0、禁止位置为负无穷的加性 mask。实际实现还有 Q/K RMSNorm、GQA 多头展开和输出投影。每层随后执行 attention residual、MLP residual。
 
@@ -230,9 +230,9 @@ $`\displaystyle u_k=W_{\mathrm{target}}z_k`$
 
 Markov head 增加一个依赖“前一个实际 token”的词表 bias：
 
-$`\displaystyle b_k=W_2\,\operatorname{Embed}_{W_1}(x_{k-1}),\qquad W_1\in\mathbb{R}^{V\times r},\quad W_2\in\mathbb{R}^{V\times r}`$
+$`\displaystyle b_k=W_2\,\mathrm{Embed}_{W_1}(x_{k-1}),\qquad W_1\in\mathbb{R}^{V\times r},\quad W_2\in\mathbb{R}^{V\times r}`$
 
-$`\displaystyle q_k=\operatorname{softmax}(u_k+b_k)`$
+$`\displaystyle q_k=\mathrm{softmax}(u_k+b_k)`$
 
 这里 `W2` 按 PyTorch Linear 的权重存储形状书写；等价的行向量矩阵乘法是 `W1[token] @ W2.T`。相当于用秩为 `r` 的分解表示一个巨大的 `V × V` token 转移矩阵。
 
@@ -277,9 +277,9 @@ $`\displaystyle c_k^*=1-\frac12\ell_{\mathrm{L1},k}=\sum_v\min(p_k(v),q_k(v))`$
 
 第三项为接受概率预测。启用 `confidence_head_with_markov` 时：
 
-$`\displaystyle c_k=\sigma\!\left(w_c^{\mathsf T}[z_k;\operatorname{Embed}_{W_1}(x_{k-1})]+b_c\right)`$
+$`\displaystyle c_k=\sigma\!\left(w_c^{\mathsf T}[z_k;\mathrm{Embed}_{W_1}(x_{k-1})]+b_c\right)`$
 
-$`\displaystyle \ell_{\mathrm{conf},k}=\operatorname{BCE}\!\left(c_k,\operatorname{stopgrad}(c_k^*)\right)`$
+$`\displaystyle \ell_{\mathrm{conf},k}=\mathrm{BCE}\!\left(c_k,\mathrm{stopgrad}(c_k^*)\right)`$
 
 代码使用 `binary_cross_entropy_with_logits`，直接输入 confidence 的原始 logit。监督标签是 **软接受概率**，不是“这次采样是否接受”的 0/1，也不是草稿最大 softmax 概率。
 
