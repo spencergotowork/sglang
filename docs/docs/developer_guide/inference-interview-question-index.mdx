@@ -1,0 +1,52 @@
+---
+title: "推理面试提问索引与术语解码"
+sidebarTitle: "提问索引与术语"
+description: "按录音时间定位推理面试的关键追问，区分 ASR 术语置信度、回答证据与知识补强入口。"
+---
+
+本页为 [知识重构与补强](/docs/developer_guide/inference-interview-knowledge) 的时间索引。提问依据自动转写和重点片段二次识别还原，未逐字人工听校或分离说话人；疑似术语保留置信度，原始音频和转写不收录在仓库。
+
+| 时间 | 还原的提问/追问 | 关键术语 | 对应补课 |
+|---|---|---|---|
+| 06:16–06:35 | 两年中训练、推理与运行时三类工作的时间比例？ | 责任范围、实际投入 | 不是技术盲区；主转写漏段已补 |
+| 07:19–08:13 | 4090与PPU分别部署什么？算子和框架怎样分工？ | 异构适配、框架集成、算子实现 | 责任边界，不能仅凭“组偏平台”推出个人能力 |
+| 09:13–10:18 | 模型用TP8还是CP8？CP与稀疏Top-K怎样兼容？ | TP、CP、DSA、Top-K | 第1课 |
+| 10:21–12:11 | CP与DSpark的兼容怎么处理？DCP交错存储，verify后才知道哪些KV保留怎么办？ | DCP、interleave、verify、commit/rollback | 第2课 |
+| 12:13–13:39 | PP异步output问题具体是什么？ | PP、MTP、output relay、send/recv配对 | 第3课；不能把当前源码当历史版本证据 |
+| 13:44–17:34 | 多rank hang一般如何定位？用过attach抓Python调用栈吗？ | py-spy、attach、调用栈、rank、等待图 | 第3课；py-spy在二次ASR明确恢复 |
+| 18:12–18:29 | 量化方案主要是MoE低精度、attention高精度？ | mixed precision、MoE、FP4 | 第4、7课；“行业标准”也需具体模型条件 |
+| 18:36–22:31 | 你主动讲述的结构化稀疏方案、格式及质量问题 | cuSPARSELt、CSR、paired-4:8、校准 | 第7课；这段主要是你的陈述，不伪装成面试官逐项设问 |
+| 22:33–23:14 | 模型优化的通信开销是什么通信？AllReduce还是别的？ | AllReduce、PP P2P、通信类型 | 第3、4课；主转写漏问题已补 |
+| 23:16–25:37 | 你陈述的驱动/graph导致rank变慢的案例 | profiler、CUDA Graph、kernel gap、arrival skew | 第4课，属于可保留并补证据的案例 |
+| 25:37–29:21 | 给一个模型，怎么优化decode TPS？ | TPS、ITL/TPOT、memory-bound、量化、投机 | 第4课 |
+| 29:21–30:38 | 为什么memory-bound适合投机？weight和KV低精度各影响什么？ | M维、weight/KV traffic、verify | 第4、5课 |
+| 30:40–32:16 | HiSparse是做什么的？相邻step的Top-K重合可优化哪里？与你提到的index sharing有何区别？ | HiSparse、resident cache、miss、index sharing | 第6课 |
+| 33:00–35:15 | 投机接受率与加速比如何推导？并发1、MoE、MTP3、接受率0.5呢？ | 接受率定义、accept length、round cost | 第5课；2.5不应未经定义就判错 |
+| 36:07–38:53 | 为什么要问TP还是EP？q_len1与4对attention、dense、通信、MoE分别有何影响？ | EP、Flash-Decoding、M维、专家并集 | 第5课 |
+| 39:01–39:32 | verify后的采样与两套词表有什么开销？ | 疑似rejection sampling、draft vocab、target vocab | 第8课；英文不能当成逐字已确认 |
+| 39:38–45:58 | 做得广与能解释性能上限的差别 | 性能建模、深度、独立排障 | 岗位匹配反馈，不新增一个技术结论 |
+
+## 容易被ASR弄错或被混用的词
+
+| 原始ASR常见写法 | 规范术语/解释 | 确定程度 |
+|---|---|---|
+| S档、SG浪、SGA | SGLang | 上下文高 |
+| dispug、dbug | DSpark，投机解码实现/路径名称 | 上下文高，末段也提及DSpark |
+| WordFi、WiFi、Wirefarm | verify / target verification，目标模型对草稿验证 | 上下文高 |
+| interleave、英特利不、unbeliever | interleaved，交错布局 | 上下文高 |
+| PoS PoI、pyspy | py-spy，进程外Python抓栈/采样工具 | 二次识别明确 |
+| 站 | 栈，call stack | 上下文高 |
+| 思索 | 死锁，deadlock | 上下文高；hang仍可能有其他原因 |
+| HIGH SPARTS、Headspot | HiSparse，host完整KV+GPU热点工作集 | 上下文高 |
+| staff、stab | step，一轮生成/验证步骤 | 上下文高 |
+| qln、qln4 | q_len=4，query序列长度 | 上下文高 |
+| Barsite、白菜 | batch size；需区分请求batch与本轮token数 | 上下文高 |
+| miner bond、慢慢绷 | memory-bound，数据供应限制执行速度 | 上下文高 |
+| Export | expert，MoE专家 | 上下文高 |
+| RejectSupply、RelaxSupply | 疑似rejection sampling，拒绝/纠正采样 | 中；依据verify后与词表上下文 |
+| 两个次表 | 两套词表/词表相关开销 | 中；不能据此断言具体kernel算法 |
+| 系数化 | 稀疏化，sparsification | 上下文高 |
+| CRR | 疑似CSR（Compressed Sparse Row） | 中；即使原意为CSR，也不准确描述cuSPARSELt结构化格式 |
+| ACS/NCS | PPU厂商profiling工具与类似Nsight Systems的时间线工具 | 具体厂商名字未核实，不按精确工具名教学 |
+
+TP/PP/CP/EP是分工维度；PCP/DCP是不同阶段的上下文并行；DSA中的Top-K选择历史token位置，MoE中的Top-K选择专家，投机参数中的topk可能是分支宽度，三个Top-K不是同一概念。

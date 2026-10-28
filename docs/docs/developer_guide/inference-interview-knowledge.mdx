@@ -1,0 +1,494 @@
+---
+title: "AI Infra 推理面试：知识重构与补强"
+sidebarTitle: "推理面试知识重构"
+description: "从面试追问重建 DCP 与投机状态、分布式排障、decode 成本模型、HiSparse、结构化稀疏与采样知识，并提供源码入口和可运行实验。"
+---
+
+最需要补的不是更多框架名，而是三种能力：**画出数据与状态的归属；从字节数、算量和通信建立成本模型；用运行时证据验证模型。** 录音中最明确的断层出现在 DCP×投机解码、hang 抓栈、HiSparse 两种复用，以及投机加速比的系统推导。
+
+## 证据与阅读方式
+
+- 依据一轮约 46 分 10 秒的 AI Infra 推理面试，保留录音时间戳供本人回听定位；[问题索引与术语解码](/docs/developer_guide/inference-interview-question-index)提供完整索引。此仓库只收录技术复盘，不包含音频、简历或原始转写。
+- 转写采用本地 large-v3/CUDA/int8_float16，并对重点片段二次识别；没有说话人分离或逐字人工听校。下文问题是**语义还原**，不是逐字引用；`rejection sampling` 等词按上下文推断。
+- “明确未掌握”指当时承认没做过或混淆了机制；“回答未展示”不能推出完全不知道。面试官的简化结论也需要限定条件。
+- 源码说明核对到 [SGLang `8252e3af63`](https://github.com/spencergotowork/sglang/tree/8252e3af630c103e960e13a77e570e810f8e3eb8)（2026-10-28 核对），链接固定该提交。只做静态阅读与 CPU 教学实验，没有运行 PPU、多卡 SGLang 或真实模型性能/质量测试；当前实现不能证明录音中历史 PR 的根因。
+- 章节中的“标杆作答”用于组织机制与证据，不应当作未经实践的个人经历。实验的运行入口与验收标准在文末。
+
+## 一、盲区地图：面试官究竟在追什么
+
+| 时间 | 问题解密 | 你的回答暴露的断层 | 证据强度与补课优先级 |
+|---|---|---|---|
+| 09:13–10:18 | TP8/CP8 究竟分别切什么？稀疏 indexer 的 Top-K 如何在 CP 后保持全局语义？ | 记得合过 PR，没有说明 query、index-K、主 KV、Top-K 索引各归谁 | 回答未展示机制；P0，见第 1 课 |
+| 10:21–12:11 | DCP 的交错 KV 存储怎样兼容 DSpark/MTP 验证、拒绝与回滚？ | 先理解成“传输”，后又解释为 PP 阶段间 output metadata；面试官随后明确说 decode CP | 明确概念混淆；P0，见第 2 课 |
+| 13:44–17:34 | 一个多进程推理服务挂住，你怎样先确定它正在等什么？ | 从开关组合、猜通信、找 PR 出发；不熟悉 py-spy attach 抓栈 | 明确工具与诊断流程缺口；P0，见第 3 课 |
+| 18:36–22:31 | 你主动介绍的稀疏 GEMM 到底采用什么硬件格式？为何有收益、质量为何退化？ | 把 cuSPARSELt 的结构化压缩说成类似 CSR；“补偿另一半”缺少所用算法与证据 | 技术模型不精确；P1，见第 7 课 |
+| 22:33–25:37 | 简历中的通信优化到底是 AllReduce、PP P2P，还是别的？通信耗时真的是网络慢吗？ | 举出了有价值的“某 rank 前序 graph 慢，拖长通信”案例，但没完整交代跨 rank 时序证据 | 是已有能力的补强，不能判为完全不懂；P1，见第 3、4 课 |
+| 25:37–30:38 | 如何系统优化 decode TPS？先判断哪个资源限制了每步延迟 | 先列 PD、HiSparse、并行参数，最后才想到 profiler；未主动讲最常见的权重量化与投机机制 | 更像缺成本模型，而不只是漏背两项技术；P0，见第 4 课 |
+| 30:40–32:16 | HiSparse 为什么主要扩并发？相邻 step 的 Top-K 重合如何减少搬运？ | 把同层跨 step 的缓存命中，与同 step 跨层的 index sharing 放在一起 | 明确维度混淆；P0，见第 6 课 |
+| 33:00–35:15 | 接受率与加速比怎样定量关联？MTP3、0.5、并发 1 还缺哪些条件？ | 知道 draft、verify 有开销，但没有先定义率、长度及一轮成本，无法落成公式 | 部分直觉已有，定量建模未完成；P0，见第 5 课 |
+| 36:07–38:53 | 为什么 verify 的 q_len=4 未必比 decode 的 q_len=1 慢四倍？TP/EP、专家路由有何影响？ | 没问 MoE 部署方式，没有逐算子分析 shape、权重复用和通信路径 | 回答未展示硬件执行模型；P0，见第 5 课 |
+| 39:01–39:32 | verify 之后 rejection sampling 与词表相关操作的开销呢？ | 这一段主要是面试官补充，没有足够独立作答，不能断言你完全没听懂 | 应补知识；P1，见第 8 课 |
+
+本轮的知识边界主要在 **框架集成 → 分布式状态管理 → kernel/通信成本模型** 之间。它没有考到页表驱动实现、NIC 固件、拥塞控制协议等层面，不能仅凭这轮就诊断为“底层驱动全面缺失”。开头 VMM、多模型混布也未被深入追问，不能因为你谈到这些就判定它们是本轮已证明的强项或盲区。
+
+## 第 1 课：CP、PCP、DCP、DSA 与全局 Top-K
+
+### 从痛点到机制
+
+长上下文带来两种不同压力：prefill 有很多 query token 的计算；decode 每步虽然只有少数 query，却要保存/读取很长历史的 KV。切分 query 工作与切分历史 KV 是两件事。
+
+| 并行方式 | 主要切分对象 | 直接目标 | 代价 |
+|---|---|---|---|
+| TP | 权重/隐藏维度、attention heads 等，具体依实现 | 让模型放得下、并行算一层 | 层内 collective、小消息延迟 |
+| PP | 模型层 | 跨设备放下模型、流水执行 | 阶段 P2P、流水空泡、输出反馈依赖 |
+| Prefill CP/PCP | 输入序列的计算任务 | 降低长输入 TTFT、分摊激活工作 | K/V 或中间结果通信、全局位置重排 |
+| Decode CP/DCP | 历史上下文 KV | 分摊 KV 容量/读带宽 | query/partial-output 等通信及状态映射 |
+
+这里的 CP 是 Context Parallelism；不同项目的 `CP` 命名可能只指其中一条路径。**不能看到 CP8 就断言每 rank 永久只存 1/8 KV。** 此版本的 `prepare_kv_for_attention()` 在需要 materialization 时委托 CP strategy；interleave strategy 的 `materialize_full_mla_kv()` 会 gather 并恢复全量 MLA KV。这是该路径的行为，不能推广到所有 backend。
+
+也不能把 TP8×PP2×CP8 机械乘成 128 卡。CP group 可能复用每个 PP stage 内的 8 个 TP ranks；只有确认 process-group 映射后，才能算实际卡数。独立三维笛卡尔分组才适用直接相乘。
+
+稀疏 attention 还多一层依赖：**先用 indexer 找应当读取的历史位置，再用主 KV 算 attention。** 分布式以后，至少要回答：
+
+1. 哪个 rank 拥有这个 query？它的全局 position 是多少？
+2. index-K 是复制还是切分？能否对全历史打分？
+3. Top-K 返回的是请求内 token position、全局逻辑 slot，还是本 rank 物理地址？
+4. 被选中的主 KV 在哪里？读取后输出怎样合并？
+
+一个便于理解的精确方案：将候选 key 空间切分，各 rank 对同一 query 打本地分并选本地 K 个；收集各 rank 候选后，再选全局 K 个。全局 Top-K 一定包含在这些本地 Top-K 的并集中，前提是分数可比较、causal mask 与 tie-break 一致。**每 rank 各取 K 个直接拼起来，会得到最多 C×K 个候选，并不等于全局 K。** 另一方案是复制 index-K，让各 rank 独立求全局 Top-K，再只读自己拥有的主 KV；它牺牲 indexer 内存换通信简化。这些是设计选择，不能未经源码确认就说你的历史项目用了哪一个。
+
+对跨 rank 切分的精确 attention，设 rank r 得到局部归一化输出 o_r 和局部 log-sum-exp l_r，则：
+
+$$
+o=\frac{\sum_r e^{l_r-m}o_r}{\sum_r e^{l_r-m}},\qquad m=\max_r l_r.
+$$
+
+不能对各 rank 输出直接求平均，因为各 rank 分母不同。LSE 是 log-sum-exp，即局部 softmax 归一化常数的对数。
+
+### 约束与生产实现
+
+DCP 用额外 collective 换取上下文相关 KV 的削减，短上下文可能得不偿失；prefill、decode、verify 的 kernel 和 metadata 支持范围也可能不同。主 KV 的切分、indexer 的切分、draft KV 的切分必须分别核对。
+
+[DCP 文档](/docs/advanced_features/dcp) 列出了模型、后端与组合限制；应以所读版本的实现说明为准，不能推广成所有 CUDA/PPU、DSA/DeepSeek-V4 路径都支持。面试中沿用的“DSA/Top-K”说法也不能替代具体模型层的稀疏/压缩 attention 实现核对。
+
+源码精读：
+
+- [DCP 索引数学](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/layers/dcp/layout.py#L23)：`get_dcp_lens()`、`maybe_dcp_kernel_indices()`。
+- [prefill CP 的 KV materialization](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/layers/attention/dsa_backend.py#L118)与 [interleave strategy](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/layers/cp/interleave.py#L384)。重点看它为何 gather，别只看 CP 开关。
+
+### 标杆作答
+
+> 我先确认您这里的 CP 指 prefill query 切分，还是 decode 历史 KV 切分；两者的存储和通信路径不同。稀疏 attention 的兼容点在于 indexer 必须保留全局候选语义，Top-K 的逻辑位置还要正确映射到各 rank 的主 KV 地址。若 index-K 切分，可以本地选候选后归并全局 Top-K；若 index-K 复制，则可以全局选完再过滤本地 KV。各 rank 算出的 attention 还要带 LSE 合并，不能直接平均。具体部署收益要衡量 KV 节省与额外通信；我需要按实际模型、版本和 backend 说明用了哪条路径。
+
+### 连环追问
+
+- **为什么本地 Top-K 再归并不会漏全局 Top-K？** 若某元素在本地已排 K 名之后，其本地已有 K 个元素不低于它，因而它不可能必须入全局 K；相同分数需统一确定性规则。
+- **某 rank 没有被选中的 key 怎么合并？** 其分区分母贡献为 0，LSE 逻辑上为负无穷；避免全空分区的 `-inf - -inf` 产生 NaN。
+- **prefill CP 能否自然接到 DCP？** 不能假定；全局位置、KV layout、page size、TP/CP group、缓存重排必须建立明确转换。
+
+最小实验：`lab_models.py` 的 `softmax_merge()` 比较集中式 attention、LSE 合并和错误的普通平均；`global_topk()` 用两个 rank 的候选分数验证“本地 K → 全局 K”与直接全量 Top-K 一致。
+
+## 第 2 课：DCP × 投机解码，本质是分布式 KV 事务
+
+### 为什么组合后出问题
+
+普通自回归沿唯一序列前进；投机解码一次计算多个候选，其中只有连续接受前缀有效。**候选 KV 可以已经算出来甚至写入显存，但不能未经验证就成为后续可见的已提交历史。**
+
+因此面试官“不能立刻存 KV”应理解为“不能直接当成最终有效 KV 提交”。“必须下一个 step 才写”只是某类实现的时序，不是算法定理。预分配最终 slot、先写后按有效长度屏蔽、临时区验证后搬运，都可能成立。
+
+用 DCP2、token 级交错举例。历史位置 0…4 已提交；候选 A/B/C 的位置为 5/6/7：
+
+| 位置 | owner = position mod 2 | 本地行 = position // 2 | 验证后状态 |
+|---|---:|---:|---|
+| 5，A | 1 | 2 | 接受，保留 |
+| 6，B | 0 | 3 | 接受，保留 |
+| 7，C | 1 | 3 | 拒绝，不能继续可见 |
+
+如果采样得到替换 C 的新 token D，D 虽然位于位置 7，**C 的 KV 不是 D 的 KV**。替换/bonus token 的 KV 是否已算出，取决于验证输入与下一轮组织方式，不能从“token 已输出”推断“它的 KV 已就绪”。
+
+上面的 `position → owner` 是教学模型。生产实现还可能先经过 `req_to_token` 得到逻辑 slot，再按 slot 或 page 决定 owner；逻辑位置、虚拟 slot、物理 row 不能混用。此版本的 `layers/dcp/layout.py` 和 `mem_cache/allocator/page_interleave.py` 就存在不同粒度的布局抽象。
+
+### 必须保持的四个不变量
+
+1. **可见性**：attention、prefix cache、后续 draft 只能看已提交前缀，以及当前 verify 按正确 causal/tree mask 允许看的候选。
+2. **归属**：所有 ranks 对逻辑长度、owner、slot 映射的理解一致。
+3. **生命周期**：拒绝的 slot 在最后一个异步使用者结束前不能复用；还要处理取消、EOS、部分接受和请求回收。
+4. **模型状态**：target KV、draft KV、hidden-state cache，以及 hybrid 模型的 recurrent/conv state 必须一起对齐接受边界。
+
+这最后一点特别容易漏：线性 attention 的状态是递推累积，不是只截断一个 KV 索引就能回滚。若 verify 计算了多个候选对应的 S_1、S_2、S_3，而只接受到第 2 步，持久状态必须是 S_2，不能保留 S_3。
+
+### 可行架构与代价
+
+| 方案 | 换来的简化 | 付出的成本 |
+|---|---|---|
+| 候选放临时区，接受后提交/搬移 | 正式历史不被错误候选污染 | scratch、复制、commit kernel 和同步 |
+| 预留最终位置，写入后按有效长度/页表屏蔽 | 减少复制 | allocator、mask、回收的正确性更复杂 |
+| draft KV 复制，target KV 做 DCP | draft 路径不必跟随 target 分片 | draft 显存按 DCP ranks 重复，必须正确预算 |
+
+不要为了少一次同步，让未完成 verify 的 slot 进入 prefix cache 或提前释放。把数据“已经在显存里”与“已经合法可读”分开，是这道题的核心。
+
+生产案例：[SGLang PR #32828](https://github.com/sgl-project/sglang/pull/32828) 描述了 Kimi hybrid 模型 DCP×DSpark 中接受后 recurrent-state 提交的问题。这是该 PR 的模型与路径事实，不是你录音中 DSV4 历史问题的已证实根因。
+
+源码精读：
+
+- [commit gate](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py#L302)：`committed_mask` 如何按 `commit_lens` 屏蔽未提交的 SWA 位置；这是具体写入路径示例，不代表所有 KV 都经此处。
+- [recurrent state 提交](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py#L1424)：为何用 `commit_lens - 1` 选择最后有效步骤；注意这里是 chain layout。
+
+### 标杆作答
+
+> 这个冲突在于投机验证前后，KV 的有效长度不同，而 DCP 又让位置映射到不同 owner rank。我会分清候选态和已提交态：先为 verify 预留可安全写入的位置，按 causal/tree mask 计算，拿到接受前缀后再统一更新长度、slot 映射与回收；拒绝部分不进入后续可见历史。还要保证 draft 的 KV/hidden state 与 target 对齐，hybrid 模型则提交最后有效 recurrent state。临时区提交更容易保证正确性，原位写加逻辑屏蔽可以省复制，但对异步生命周期和 allocator 的要求更高。
+
+### 连环追问
+
+- **候选全部拒绝怎么办？** 已提交前缀不被污染；补偿 token 按正确分布产生；它的 KV 在适当 forward 中补齐。指标里的 `commit_len` 是否包含已有输入 token，要读实现，不能生搬教学计数。
+- **tree draft 怎么提交？** 接受的是路径上的索引集合，未必是 flatten 后连续前几个 slot；按 accept-index 做 gather/commit。
+- **部分接受同时发生 cancel/EOS 怎么办？** 截断输出与状态边界，等最后消费者结束后释放，避免双重 free、旧事件写到新请求。
+
+最小实验：`lab_models.py:dcp_commit()` 枚举 0…3 个候选被接受，分片再还原必须等于有效前缀；用已拒候选 KV 冒充补偿 token 的 KV 应视为错误。教学模型不模拟真实异步 GPU 内存回收。
+
+## 第 3 课：hang 定位不是猜 PR，是还原等待图
+
+### 核心概念与排查顺序
+
+**hang** 是进程仍在但没有前进；它可能是通信死锁、锁等待、某 rank 先异常退出、GPU kernel/driver 未返回、队列无生产者，或仅仅非常慢。组合开关实验能缩小触发条件，但“只在 PP+MTP 出现”并不能直接证明通信死锁。
+
+面试官说的是 **py-spy**，不是某个 SGLang 专属工具。`attach` 表示附着正在运行的进程；调用栈描述此刻经过哪些函数、停在何处。Python 栈、C++/native 栈和 GPU timeline 是互补证据。
+
+可迁移的操作顺序：
+
+1. 保存 PID↔global rank↔TP/PP rank↔host/device 映射；确认有没有 rank 消失、报错或仍在计算。
+2. 对**所有相关 worker**抓栈，间隔再抓一次，区分稳定阻塞点与正常慢调用；不能只抓 HTTP 主进程。
+3. 对齐各 rank 的 step/microbatch、process group、op 序号、src/dst、shape/dtype、enqueue 与完成事件。
+4. 画等待边，确认有没有形成环；检查分支跳过、通信顺序和 buffer 生命周期。
+5. 再做最小开关/拓扑消融、查对应源码/历史 PR，用证据支持修复假设。
+
+命令示例（PID 替换为实际 worker；权限按环境配置）：
+
+```bash
+py-spy dump --pid 12345
+py-spy dump --pid 12345 --native
+py-spy record --pid 12345 --duration 10 --output worker.svg
+```
+
+[py-spy 官方说明](https://github.com/benfred/py-spy)解释了 `dump`、`record` 与从进程外读取 CPython 状态的方式。attach 权限不足是运行环境问题，不等于业务死锁。不要默认抓 locals：它未必必要，也可能包含请求数据。
+
+### 为什么 async send 也可能卡
+
+最小等待环：rank 0 阻塞等待 send 被接收，rank 1 同样先 send，两者都没走到 recv。更隐蔽的是 Python 的 isend 已返回，但 GPU 通信流中的 send 依赖 peer recv，而后续 recv 又排在受阻的流后，设备侧仍无法推进。
+
+“偶数先发、奇数先收”可以破坏特定邻接链路的等待环，但不是任意拓扑的万能证明。仍要验证 PP3、不同 microbatch、prefill/decode 分支是否成对。NCCL 的收发配对与 group 语义也不能用 CPU Gloo 实验直接替代。
+
+此版本 [scheduler_pp_mixin.py](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/managers/scheduler_pp_mixin.py#L1430) 的普通输出反馈路径按 PP rank 奇偶选择顺序；NPU 且 PP=2 时走单独的配对收发路径。**这是当前提交的证据，不能倒推录音中的历史 PPU 镜像已经具有相同逻辑。**
+
+如果应用通过 PyTorch ProcessGroupNCCL 通信，可以结合 [Flight Recorder](https://docs.pytorch.org/tutorials/unstable/flight_recorder_tutorial.html) 的跨 rank op 记录。若使用框架自己的通信封装、PCCL 或绕过 c10d 的调用，则要在对应路径采集证据，不能假定 PyTorch 环境变量覆盖所有通信。
+
+### 标杆作答
+
+> 我会先保存现场并抓全体 worker 栈，判断是某个 rank 没到通信，还是双方已到但操作没有匹配。再对齐通信组、step/microbatch、op 序号、peer 和 tensor metadata；若形成循环等待，就查发送接收顺序与流依赖。Python 的异步返回不保证设备侧已经完成，我会结合 native 栈和 GPU timeline。确认具体等待图后，再做 PP/MTP 开关消融与源码修复，并覆盖 PP2/PP3、chunked prefill、decode 和取消等分支。
+
+### 连环追问
+
+- **所有 rank 栈都在 wait，就是网络有问题吗？** 不是；可能等着一个更早异常/没入组的 rank，或操作序号/shape 不匹配。
+- **两个 rank 一个 send 一个 recv，为何还卡？** 核对 communicator、peer、tensor大小、调用顺序、stream/event，而不是只看函数名。
+- **加日志后不复现怎么办？** 日志可能改变时序；用有限 ring buffer、低频抓栈、NVTX/设备事件等减小扰动，并保留原始时间信息。
+
+最小实验：[hang_demo.py](https://github.com/spencergotowork/sglang/blob/docs/inference-interview-knowledge/examples/runtime/inference_interview/hang_demo.py) 使用两进程 CPU/Gloo，`bad` 两端都阻塞 send，8 秒超时；`good` 按 rank 分别 send→recv / recv→send。两种已运行，预期结果见文末运行说明。它验证等待环概念，不证明 PPU/NCCL 的具体实现。
+
+## 第 4 课：decode 优化先建立成本模型
+
+### 第一步：TPS 是谁的 TPS
+
+- 单请求生成速度：近似为生成 token 数 / decode 时间；要明确是否扣掉首 token、统计多少个 interval。
+- 服务总吞吐：所有完成/产生的输出 token / 测量墙钟时间，受并发、排队、batching 影响。
+- ITL：相邻输出 token 的间隔；TPOT 常指一段生成阶段的平均每 token 时间，具体口径需说明。
+- TTFT：从请求开始到首 token；包括哪些排队/网络阶段要统一。
+
+“TPS 的 P99”不一定无意义，但如果关心流式卡顿，通常明确说 **P99 ITL/TPOT** 更直接；吞吐的下尾和延迟的上尾不是同一个方向。
+
+### 从矩阵乘推导 memory-bound
+
+对 `Y=XW`，X 为 `[M,K]`、W 为 `[K,N]`：
+
+$$
+F\approx 2MKN,\quad B\approx b_WKN+b_XMK+b_YMN.
+$$
+
+当 W 的读取占主导、以 BF16 为例，算术强度 I=F/B 约为 M FLOP/byte。M=1 时，读很大权重只服务一行输入；M 增至 4 时，如果同一权重 tile 被复用，算量增加而权重字节不必增加四倍。
+
+Roofline 的粗模型是：
+
+$$
+T_{kernel}\gtrsim\max(F/P_{eff}, B/BW_{eff}).
+$$
+
+这是下界/诊断模型，不是完整延迟预测。真实执行还受 occupancy、layout、launch、同步、kernel dispatch、缓存和未重叠通信影响。对于一个有依赖的 step，应分析关键路径；不能把所有 profiler kernel duration 简单相加当成墙钟时间。
+
+**memory-bound 指速度受数据供应限制，不是显存容量装不下。** 容量瓶颈会限制并发、触发迁移或 OOM；带宽瓶颈会拖长每步，两者有关但不相同。GDDR/HBM 都可成为显存带宽约束，并非所有卡都是 HBM。
+
+[NVIDIA Roofline 指南](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#roofline-charts)给出了算术强度与计算/带宽上界的测量框架。用当前精度/指令对应的 roofline，而不是拿 FP32 峰值判断 Tensor Core kernel。
+
+### 把手段映射到瓶颈
+
+| 已确认的主要成本 | 可验证的手段 | 失败边界 |
+|---|---|---|
+| 权重读取 | weight-only/W8/W4、batching、投机 verify 复用 | 解量化、质量、kernel 不匹配，或已经 compute-bound |
+| 历史 KV 读带宽 | KV 量化、GQA/MLA 原生压缩、DCP、模型原生稀疏 attention | 不能任意把 dense 模型改成稀疏而声称等价；通信/转换有成本 |
+| KV 容量限制并发 | paged allocation、缓存/迁移、HiSparse、准入预算 | 容量改善不保证单请求 step 更快 |
+| host launch/调度间隙 | CUDA Graph、kernel fusion、减少 host 同步 | 固定地址、动态shape、capture兼容性；graph不消除所有GPU内部间隙 |
+| TP/EP/PP通信 | 减少collective、拓扑/并行度调整、低延迟路径、overlap | rank arrival skew、SM占用、实际互连与backend支持 |
+| prefill 干扰 decode | chunked prefill、PD 分离与容量配比 | 需要KV转移、额外卡和路由；不直接修复孤立decode kernel慢 |
+
+PD 是 Prefill/Decode 分离。你在 28:30 附近提到 decode 没有可用 KV 槽位、使 prefill 侧等待，这是有实际价值的观察；应归到**准入与容量背压**，不能拿它回答所有“decode 单步如何更快”的问题。可读 [SGLang PD 官方文档](/docs/advanced_features/pd_disaggregation)。
+
+### 你已有的好案例怎样形成证据链
+
+23:16–25:37 的描述体现了“通信时间可能包含等慢 rank”的意识。理想证据是：同一通信 op 对齐，各 rank 的前序计算结束时刻不同，快 rank 的 collective 停留长，而真实数据传输量/算法没有变化；缩小 graph 重放复现，固定请求/shape和时钟条件，驱动版本 A/B 后差异消失。
+
+只凭“驱动升级后变快”不能唯一证明某个驱动内部缺陷；可把贡献准确表述为：**定位到通信前 graph/rank skew，提供最小复现和 trace，供应商修复驱动后同条件回归恢复。**
+
+### 标杆作答
+
+> 我先确认优化单请求生成速度还是服务总吞吐，以及 batch、上下文长度、模型精度与 TP/EP 拓扑。然后用代表性请求分解 decode step 的权重读取、attention KV读取、MoE、通信和host开销。小batch若主要是weight bandwidth，优先看量化与投机复用；长context若KV占主导，看KV压缩/分片；若是小kernel与host间隙，看graph/fusion；若通信长，先排除rank到达不齐。每一项用同条件A/B，报告ITL尾部、吞吐和质量，而不只开更多选项。
+
+### 连环追问
+
+- **量化一定同比例提速吗？** 不；scale/metadata、解量化、padding和非量化算子限制收益，用Amdahl与实际kernel占比估计。
+- **batch越大越好吗？** 总吞吐可能上升，单请求ITL和排队延迟可能恶化；达到compute-bound后继续加batch不再有同等收益。
+- **抓到通信占比高，为什么不先换通信库？** 先对齐rank到达时刻、通信量与关键路径，区分等待与真正传输瓶颈。
+
+最小实验：固定一个足够大的BF16 W，扫M=1/2/4/8/32；用CUDA events和warmup分别记录GEMM时间，再用profiler看kernel是否换型、DRAM字节是否变化。避免只重复读驻留L2的小W，然后宣称测到了显存带宽。这个GPU实验本次只设计，未执行。
+
+## 第 5 课：接受率 → 有效产出 → verify成本 → 加速比
+
+### 先消除录音里的 0.5 歧义
+
+令 gamma 为每轮草稿数量，A 为最终接受的草稿前缀长度，L 为本轮新增输出数量。在经典chain、无EOS/长度截断、每轮还有一个补偿/bonus token的计数约定下：
+
+$$
+L=A+1,\quad S\approx\frac{E[L]T_1}{T_{draft}(\gamma)+T_{verify}(\gamma+1)+T_{extra}}.
+$$
+
+T1 是不投机时同条件生成一个token的时间。`T_extra` 包括采样、状态commit、必要通信等；真实overlap时应以关键路径时间替代简单逐项相加。
+
+**口径一：日志里的草稿接受比例** r = 总接受草稿数 / 总提出草稿数。若每轮固定gamma，则 E[L]=1+gamma r。MTP3、r=0.5，得到2.5。录音35:03–35:15讨论的2.5与此口径一致。
+
+[metrics_reporter.py](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/managers/scheduler_components/metrics_reporter.py#L972) 正是分别计算每轮accept length和 `correct_drafts / (num_rounds × draft_per_round)`。但EOS、ragged宽度、不同版本的计数仍需核对；当前源码不证明面试官当时用的统计器完全相同。
+
+**口径二：每个位置在前缀都接受条件下的通过概率** alpha。若简化为各位置条件概率都等于alpha：
+
+$$
+E[L]=1+\alpha+\alpha^2+\cdots+\alpha^\gamma.
+$$
+
+gamma=3、alpha=0.5，得到1.875。更一般是 `1 + p1 + p1*p2 + p1*p2*p3`；或者直接统计实测前缀长度分布，不必强加独立同分布假设。
+
+**不能把2.5武断改判为1.875，也不能不定义接受率就背2.5。** 同一份模拟里，条件alpha=0.5时，日志总草稿接受比例约0.292，而不是0.5。
+
+经典简化把单次verify成本近似T1、每个draft token成本近似cT1，则速度因子为 `(1+alpha+...+alpha^gamma)/(1+gamma*c)`。它的假设与推导见 [Leviathan等，ICML 2023](https://proceedings.mlr.press/v202/leviathan23a.html)。不要把此简化分母直接用于MoE/EP或已经饱和的生产服务。
+
+### 为什么 q_len=1 → 4 可能比较平
+
+“并发1”是一个请求；verify可以同时处理这个请求的多个位置，所以q_len=4，许多线性层的有效M也变成4。**一个请求的4个query共享历史，不等于4个互不相关请求的KV。**
+
+- Dense projection/FFN：若权重带宽主导，4行输入复用同一权重，字节不随M同比增长，因此时间可能近似平；算量仍增长，不能说“没有计算变化”。
+- Attention：若kernel在query tile内复用相同历史KV，4个query可能共享读取；Flash-Decoding沿KV长度切分并合并局部softmax，提供更多并行。但q_len变化也可能换dispatch、改变split数、临时空间与占用；4倍query并不无条件免费。
+- 通信：小消息可用 `T≈固定延迟+字节数/有效带宽` 理解，字节翻4倍不必时间翻4倍；越过算法/协议阈值、换拓扑或遇拥塞则可能跳变。
+
+源码精读 [FlashAttention split-KV调度](https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp)和 [NCCL-tests性能指标说明](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md)。前者确认shape会影响调度；后者明确区分小消息延迟与大消息带宽。
+
+### MoE为什么必须追问TP还是EP
+
+设每token路由k个专家，4个query激活专家集E1…E4。唯一专家数U满足 `k ≤ U ≤ min(4k, 专家总数)`。专家权重的读流量与这个并集、cache驻留、rank放置密切相关，而不只是“4个token”。
+
+- 专家相同：可对同专家输入做小batch，提高权重复用；但routing、计算和输出处理仍可能增加。
+- 专家不同：集群读取的专家权重可能增大；若专家分布在不同EP ranks，可并行执行，墙钟不必增大四倍。
+- EP：需要dispatch/compute/combine，考察网络、小消息、最慢rank、专家负载与SM占用。
+- TP：专家权重/计算可能分片并引入collective；不能把同样的专家并集直接套成同样的时间。
+
+所以面试官“不同专家时MoE耗时翻4倍”适合作为某些权重流量上界的直觉，**不是普适墙钟结论**。生产通信可读 [DeepEP官方实现](https://github.com/deepseek-ai/DeepEP)；其API持续演进，应固定自己的版本再追实际调用路径。
+
+### 标杆作答
+
+> 先确认0.5是总草稿接受比例，还是每个位置的条件通过率；也确认MTP3代表3个草稿、verify宽度4。若是前者且无截断，平均每轮输出2.5个token，但加速比还要除以这一轮相对普通decode的耗时。我会拆draft、target verify、采样commit和未重叠通信。并发1时dense层和attention可能靠权重/KV复用，使q_len1到4延迟接近平；MoE则必须知道TP还是EP以及专家路由重合，才能估计新增权重读取与dispatch/combine。最后用实测verify/T1与平均输出长度给出预期速度范围，检查实测差距落在哪段。
+
+一个具体估算：若实测E[L]=2.5、T1=10ms、全轮成本14ms，则约 `2.5×10/14=1.79倍`。数字仅用于展示计算，不是本项目指标。
+
+### 连环追问
+
+- **接受率一样，速度为什么不同？** 前缀长度分布、draft架构/长度、verify宽度、路由、上下文、采样配置与batch不同；先固定接受率定义和其他条件。
+- **新增一个草稿是否值得？** 比较新增的有效产出期望与新增draft/verify/commit成本；gamma越长，后位通过前缀的概率通常越小。按batch/上下文调gamma需用实际成本曲线。
+- **memory-bound就一定投机获益吗？** 不；必须满足 `E[L]*T1 > T_round`。低接受率、昂贵draft、专家路由分散、额外KV或高batch都可能使它亏。
+
+最小实验：`lab_models.py:acceptance()`模拟10万轮，区分1.875与2.5；`expert_union()`比较相同/不同专家的集群字节与rank分布。真实GPU验证则固定B=1与context，测q_len1/4、记录每层kernel、专家路由及collective时间；本次未执行该GPU实验。
+
+## 第 6 课：HiSparse、缓存命中、跨层index sharing是三件事
+
+### 为什么需要它
+
+模型本来只对Top-K历史做attention时，每请求仍把全部历史KV常驻GPU会限制并发。HiSparse把完整主KV放在host pinned memory，GPU留热点buffer，按当前选择补齐缺失项。它用CPU容量与CPU↔GPU传输复杂度换GPU容量。
+
+不要混淆三种K：请求上下文总长N；模型attention实际选中K个历史位置；GPU热点buffer容量B。B通常要覆盖模型需求与缓存策略，不能通过随意调小配置K改变模型语义。
+
+| 维度 | 固定什么、改变什么 | 真正复用的东西 | 是否仍需得到当前Top-K |
+|---|---|---|---|
+| 同层、相邻生成step | layer不变，t→t+1 | 主KV已经在GPU，减少host搬运 | 通常需要；旧选择不能冒充当前选择 |
+| 同step、不同layer的index sharing | t不变，layer变化 | 模型规定共享的选中位置/索引 | 可按模型设计跳过部分indexer；各层主KV仍不同 |
+| 跨请求prefix cache | 请求变化，前缀相同 | 同模型同层的已计算前缀KV | 取决于执行阶段，不等于上面两种 |
+
+录音31:24附近的核心是：若当前选择集合S_t与GPU resident集合R_t高度重合，只需搬 `S_t - R_t`。不是因为前后Top-K相似，就不再计算当前选择，更不是只对1%历史做attention。
+
+假设K=2048，99%命中，理论miss约20个token；attention仍用2048个，只有新增搬运接近20个。这里的99%是教学假设，录音中的“1%”不能作为跨模型、跨层、跨任务的实测常数。
+
+### 性能边界
+
+吞吐可以通过省显存增加batch而提高；在同batch下，引入host访问反而可能拖慢单请求TPS。与原本频繁换入全量KV的基线相比，优化后的HiSparse也可能改善单请求速度，所以“只能改善吞吐”是面试语境下的简化，不能绝对化。
+
+host IO还受PCIe/NVLink-C2C、NUMA、pinned memory预算、miss是否集中、预取是否准确影响。若某次step热点突变，miss暴增，就要看ITL尾部，不能只报告平均命中率。
+
+同step跨层index sharing在模型声明的层组内可以复用索引；它不意味着第l层的KV数值能给第l+1层直接用。coordinator还会利用已知的共享索引预取后继层自己的KV，这与跨step的resident命中可以组合，但要分别证明。
+
+必读：
+
+- [HiSparse官方指南](/docs/advanced_features/hisparse_guide)：当前模型、PD与后端条件。
+- [coordinator](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/managers/hisparse_coordinator.py#L740)：shared-index prefetch如何做plan-then-IO；追hit/miss、stream/event，而不是只看LRU名词。
+
+### 标杆作答
+
+> HiSparse主要缓解稀疏attention模型的KV容量压力：完整KV在host，GPU留工作集，得到当前Top-K后查询resident映射，仅搬miss项，再用当前选中的KV算attention。同一层相邻step的Top-K若重合，就复用已驻留数据；这与同一step跨层共享indexer索引不同，后者由模型结构定义。它可能以额外IO换更高并发，总吞吐收益和单请求延迟要分别测，并重点看热点突变时的miss与ITL尾部。
+
+### 连环追问
+
+- **LRU命中就能不做Top-K了吗？** 不能；cache解决“值在哪里”，Top-K解决“本步需要哪些值”。
+- **预取会不会读错后面层？** 必须按该层KV与有效请求映射加载；event保障消费者不会早于copy完成，淘汰不能覆盖在用slot。
+- **dense模型能直接套吗？** 直接丢弃未选历史通常改变算法；要有原生稀疏结构或另外的质量/等价性论证。
+
+最小实验：`lab_models.py:cache_axes()`用前一步 `{1,2,3,4}`、当前 `{2,3,4,9}`，只搬9，但attention必须用当前四项。再构造热点完全翻转，观察miss由1变4；GPU性能实验应同时测总吞吐和ITL，不能从集合实验推速度。
+
+## 第 7 课：量化、结构化稀疏与kernel格式必须串起来
+
+### 录音里的技术问题
+
+20:48–21:37你说明了保留一半、通过索引跳过零，但把这一路径解释为类似CSR。对cuSPARSELt的Sparse Tensor Core路径，这个模型过于泛化：**它依赖固定局部稀疏模式、打包值与专用metadata，不是任意CSR矩阵直接得到同样加速。**
+
+CSR通常保存 `row_ptr/col_idx/values`，支持较任意的位置，但有索引和不规则访存成本。结构化稀疏把允许位置约束在小组内，让硬件能按紧凑metadata执行固定模式的MMA。
+
+FP16/BF16常见2:4语义；这里讨论的 cuSPARSELt FP4 稀疏格式是 paired-4:8，应明确8个值按相邻pair分组、选择两个pair保留。它不是“8个里任意4个非零”。[cuSPARSELt压缩接口](https://docs.nvidia.com/cuda/cusparselt/functions.html#cusparseltspmmacompress)列出与dtype、转置方向有关的约束；实际以对应库版本的PruneCheck、压缩与kernel正确性验证为准。
+
+### 一条完整的数据路径
+
+```text
+原始权重
+  → 按所用剪枝算法与硬件pattern生成掩码
+  → 可选校准/重构补偿（算法必须说清）
+  → 按kernel要求量化、pack并生成scale
+  → sparse压缩/metadata与descriptor
+  → 运行时激活变换/量化
+  → sparse GEMM与epilogue
+  → 模型级数值、业务质量、性能验证
+```
+
+这个顺序是说明依赖的示意，不是所有工具固定先剪枝再量化；联合优化和不同转换顺序都存在。必须报告自己实际采用的顺序与误差来源。
+
+“剩余一半补偿被剪掉的一半”不是硬件自动保证。校准/重构可能优化 `||XW-XW_hat||`，依赖真实或代表性X；直接幅值剪枝本身没有这种保证。JSON格式正确也不能证明语义质量恢复；录音中丢失介绍词，应该用业务样本与logits/层输出定位，而不是只查NaN/乱码。
+
+### FP4不是单一格式
+
+E2M1只描述4bit数值编码。标准NVFP4还包含16值block的E4M3 scale与tensor级FP32 scale；这与group-32、FP32 scale或其他block-scaled kernel layout并非同一种存储协议。[NVIDIA NVFP4格式说明](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
+
+因此“用了FP4”后还要补：W/A/KV分别什么dtype、group size、scale类型/布局、pack规则、accumulator与输出dtype、kernel与SM支持。CPU上把FP4解回BF16再普通matmul，不等于原生FP4 Tensor Core计算。
+
+### 权衡、答案与追问
+
+节约字节/乘法，付出精度损失、metadata、激活量化、布局转换与维护成本。若原来主要是attention或通信，稀疏MLP不会让整机同比加速；若小M的sparsekernel不够高效，理论FLOPs减半也未必更快。用Amdahl：被优化部分占f、其加速s，则整体上限为 `1/((1-f)+f/s)`，还未计新增开销。
+
+> 我会区分量化和结构化剪枝：前者减少每个值的位宽，后者按硬件允许的模式删乘法。我的kernel要用指定dtype、pattern、scale和压缩metadata，不能用普通CSR来解释。剪枝质量靠所用校准/重构方法和业务评测确认，硬件只执行已给出的压缩结果。性能需要把激活量化、转换、sparseGEMM与epilogue一起计时，再看它在完整请求中的占比。
+
+- **保留50%为何没快2倍？** 只有部分算子被优化，新增转换/metadata、shape利用率和其他瓶颈限制收益。
+- **负零一定错误吗？** E2M1可以有负零；是否需要规范化取决于压缩/消费者契约。要用bit-pattern与原kernel复现，不能仅凭0x8就判硬件bug。
+- **校准集过了为何线上退化？** 分布、长度、模板、outlier、剪枝顺序或scale/layout可能变化；分离数值实现错误与不可避免的量化/剪枝误差。
+
+精读1–2处：[cuSPARSELt官方函数与格式](https://docs.nvidia.com/cuda/cusparselt/functions.html)、[NVFP4 格式说明](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)。CPU 数值模型不能当作 SM120 kernel 验证。
+
+最小实验：同一层依次比较原始dense、剪枝但仍dense执行、量化后反量化dense、真实sparsekernel输出，分离剪枝误差、量化误差、压缩/布局错误。真实支持卡上再扫M计时；本次只给实验设计。
+
+## 第 8 课：rejection sampling、词表与“无损”边界
+
+### 为什么仅比较token相等还不够
+
+greedy解码时，可以比较候选与target argmax是否一致；随机采样时，直接“相同就收、不同时从target重采”通常不能保持目标分布。经典speculative sampling用修正接受/拒绝规则。
+
+令p为当前prefix下target分布，q为实际draft proposal分布。候选x从q采样后，以 `min(1,p(x)/q(x))` 接受；拒绝时从归一化的 `(p-q)_+` 采样。接受分支对token x贡献 `min(p(x),q(x))`，拒绝分支补足差额，最终恢复p。若全草稿接受，再从target对应末位置产生bonus token。见 [Chen等，Speculative Sampling](https://arxiv.org/abs/2302.01318)。
+
+### 系统开销在哪里
+
+大词表V、验证宽度Q下，logits矩阵约 `[B*Q,V]`；LM head、softmax/采样过滤、p/q访问、接受判定、prefix scan、补偿采样与host同步都可能有成本。不要把这些统称一个“verify时间”后就不再拆。
+
+小词表draft可以减小draft LM head和proposal相关buffer，但必须映射到target token ID，并把不在draft词表的q视为0；被target支持的token仍可从纠正分布出现。**不能把target也任意裁到draft小词表并声称保留完整p。** tokenizer、采样变换（temperature/top-k/top-p）、specialtoken与词表padding也必须一致处理。
+
+生产实现可以融合采样/接受kernel、只保留必要位置、消除不必要host同步，并在支持时采用reduced draft vocab。局部优化不能破坏纠正分布或随机数语义；“统计分布等价”也不意味着固定seed下逐token一定与另一种调度实现相同。
+
+精读：[Chen等原始论文页面](https://arxiv.org/abs/2302.01318)；[EAGLE3词表映射](https://github.com/spencergotowork/sglang/blob/8252e3af630c103e960e13a77e570e810f8e3eb8/python/sglang/srt/models/llama_eagle3.py#L306)，追`draft_vocab_size`及加载时`d2t/t2d`，再追实际spec sampling kernel。录音最后的英文识别并不清晰，本节按“verify后、两套词表、小词表draft”的上下文解释，不能冒充逐字确认。
+
+### 标杆作答与追问
+
+> target forward只是验证的一部分。随机采样要用实际p/q执行正确的接受和纠正采样，才能保持target分布。大词表下LM head、概率处理和sampling kernel也可能成为瓶颈；小词表draft可降低draft开销，但必须正确映射token，并保持target的完整支持集。我会分别profile logits、采样、prefix接受与commit，优先融合并减少host同步，同时用小词表分布实验验证等价性。
+
+- **draft给某token概率0，target大于0怎么办？** draft不会提出它，但拒绝后的残差分布可以补上；不能丢掉该token。
+- **p=q会怎样？** 接受概率1，不进入零总量残差的采样分支，避免0/0。
+- **top-p改变了分布还无损吗？** 相对于明确配置后的target采样分布讨论；proposal与接受规则必须使用实际分布，不能拿过滤前q做接受比。
+
+最小实验：`lab_models.py:exact_rejection()`在三个token上直接验证接受质量与残差质量相加等于p，其中一个target token不在draft支持集；这是概率恒等式验证，不是完整语言模型sampling实现。
+
+## 二、临场遇到陌生概念时，怎样继续推导
+
+**框架一：确认切分对象与状态边界。**
+
+> 这个名字我没有直接用过。我先确认：您说的CP是在prefill分query，还是decode分历史KV？我想把切分对象确认清楚。如果是后者，我会先画token位置到rank/slot的映射，再分析verify前后哪些状态可以提交，避免把它和PP阶段通信混在一起。
+
+**框架二：先声明未知，再给可检验模型。**
+
+> 这个backend的具体kernel时延我没有测过，不能直接报倍数。我能先按成本推：每轮有效输出多少token、读多少权重/KV、增加哪些通信和采样；再给需要测的Tdraft、Tverify和commit时间。您这里假设的是TP还是EP、单请求还是服务吞吐？这些会实质改变结论。
+
+只问会改变推导的边界；不要连续索要所有配置。确认一两个关键条件后，明确默认假设并继续。避免用“我知道有这个PR”“agent解决了”替代机制；可以诚实区分“我负责集成和回归”与“我能证明的实现不变量”。
+
+## 三、定向实践清单与完成标准
+
+| 顺序 | 实践产物 | 完成标准 | 本次状态 |
+|---|---|---|---|
+| 1 | 接受率与速度模型 | 能解释0.5在两种口径下分别对应2.5/1.875；给出实测成本后的速度估计 | CPU模型已运行 |
+| 2 | DCP2候选提交图 | 任意接受长度下恢复出的KV等于有效前缀；能说明补偿token的KV何时生成 | CPU模型已运行 |
+| 3 | 两进程hang定位 | 从两个worker栈与通信顺序确定等待环；改顺序后完成 | Gloo坏/好两种已运行；未运行py-spy attach |
+| 4 | LSE合并 | 证明局部softmax普通平均不等价，LSE加权与集中式一致 | CPU模型已运行 |
+| 5 | HiSparse集合模型 | 能区分当前选择、GPUresident、miss与跨层索引；构造热点突变 | CPU模型已运行 |
+| 6 | MoE专家并集/EP放置 | 区分集群读字节增长与最慢rank墙钟增长 | CPU集合模型已运行 |
+| 7 | 精确rejection采样质量 | 小词表p/q含q=0时仍恢复完整p | CPU恒等式已运行 |
+| 8 | M/q_len性能扫描 | 固定硬件/精度/context，测M/q_len1→4→8，能解释kernel与通信变化 | 给出设计，未运行真实GPU模型 |
+| 9 | 稀疏GEMM误差分解 | 分清剪枝、量化、压缩/layout误差；计入转换/epilogue | 给出设计，未运行SM120 kernel |
+
+实验源码：[lab_models.py](https://github.com/spencergotowork/sglang/blob/docs/inference-interview-knowledge/examples/runtime/inference_interview/lab_models.py)（Python 3.10+ 标准库）、[hang_demo.py](https://github.com/spencergotowork/sglang/blob/docs/inference-interview-knowledge/examples/runtime/inference_interview/hang_demo.py)（Linux、安装带 Gloo 的 PyTorch，本次用 2.11.0+cu130 的 CPU 路径验证）。均无需 GPU、模型权重或 SGLang 服务。
+
+在仓库根目录运行：
+
+```bash
+python3 examples/runtime/inference_interview/lab_models.py
+python3 -m torch.distributed.run --standalone --nproc-per-node=2 examples/runtime/inference_interview/hang_demo.py --mode good
+python3 -m torch.distributed.run --standalone --nproc-per-node=2 examples/runtime/inference_interview/hang_demo.py --mode bad
+```
+
+预期：第一个命令输出机制验证的 JSON；条件通过率 0.5 对应理论每轮产出 1.875，固定种子模拟约 1.87639。`good` 输出两条 `done` 并正常退出；`bad` 两端都停在 send，约 8 秒触发 process-group 超时并返回非零，**这个失败是实验的预期结果**。若要练习抓栈，可加 `--pause 15`，对打印的两个 worker PID 分别运行前述 py-spy 命令；本次未验证 attach。
+
+这些实验验证数学与状态契约，不是面试项目性能复现；不导入 SGLang，不覆盖真实 allocator、异步 GPU 回收或 NCCL/PCCL 协议。
+
+## 四、面试官说法的适用边界
+
+| 录音中的简化表述 | 更严格的工程理解 |
+|---|---|
+| proposal KV不能写，得等下一step | 不能未经验证提交为有效历史；临时写/预留slot+逻辑屏蔽均可，时序依实现 |
+| memory-bound，投机肯定赚 | 只有每轮有效产出的价值超过draft+verify+extra成本才赚 |
+| M/q_len1变4没有性能损失 | 权重/KV复用且未越过kernel/硬件阈值时可能接近平；不是所有shape的定律 |
+| 专家不重合，MoE时间翻4倍 | 唯一专家权重流量可能增大；EP并行、缓存、路由分布与关键路径决定墙钟 |
+| HiSparse不能增加TPS，只能吞吐 | 在原本全GPU驻留的同batch基线上主要扩容量；其他基线与优化条件下单请求延迟也可能变化 |
+| 相邻step只读Top-K的1% | 可能指仅搬miss的少量KV；不是attention只算1%，也不是普适命中率 |
+| dense层M增4倍却慢3倍，算子就有问题 | 可作为特定已知带宽区间的排查线索；先核对cache、kernel切换、算力阈值与shape，不能直接定罪 |
+
+末段39:38–45:58，面试官反复强调“解释性能是否合理、上限在哪”，并表示当前岗位期待能够较快独立承担这类优化。这是对**本岗位的深度与即战力匹配**的反馈；不等同于对你所有工程经历的否定。补强应以“给出预期 → 观测偏差 → 定位原因 → 验证修复”为验收，而不是以读完多少技术名词为验收。
